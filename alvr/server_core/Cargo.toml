@@ -54,4 +54,7 @@ tokio-tungstenite = "0.20"
 tokio-util = { version = "0.7", features = ["codec"] }
 serde = "1"
 serde_json = "1"
-sysinfo = "0.33"
+# Default features enable the `multithread` feature, which starts a rayon thread pool. This crate
+# is linked into the SteamVR driver dll, and those threads would outlive the dll when Steam
+# unloads it after a factory probe, crashing the host process. Only `system` is needed here.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
