@@ -34,6 +34,31 @@ pub const fn lazy_mut_none<T>() -> OptLazy<T> {
     Lazy::new(|| Mutex::new(None))
 }
 
+// Diagnostic helpers, used by the verbose logging in alvr_sockets and alvr_server_core. These are
+// deliberately unconditional (they use `log` macros directly, not the `dbg_*` macros which are
+// compiled out in release builds) so that a release build of the driver can be diagnosed.
+pub fn hex_preview(bytes: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 48;
+
+    let mut preview = String::with_capacity(MAX_PREVIEW_BYTES * 2 + 3);
+    for byte in bytes.iter().take(MAX_PREVIEW_BYTES) {
+        preview.push_str(&format!("{byte:02x}"));
+    }
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        preview.push_str("...");
+    }
+
+    preview
+}
+
+pub fn io_err_desc(e: &std::io::Error) -> String {
+    format!(
+        "{e} (kind: {:?}, raw_os_error: {:?})",
+        e.kind(),
+        e.raw_os_error()
+    )
+}
+
 // Simple wrapper for AtomicBool when using Ordering::Relaxed. Deref cannot be implemented (cannot
 // return local reference)
 #[derive(Default)]

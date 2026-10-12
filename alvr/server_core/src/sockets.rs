@@ -1,6 +1,6 @@
 use alvr_common::{
     anyhow::{bail, Result},
-    warn, ConnectionError, HandleTryAgain, ToAny, ALVR_NAME,
+    hex_preview, info, warn, ConnectionError, HandleTryAgain, ToAny, ALVR_NAME,
 };
 use alvr_sockets::{CONTROL_PORT, HANDSHAKE_PACKET_SIZE_BYTES, LOCAL_IP};
 use flume::TryRecvError;
@@ -18,11 +18,25 @@ pub struct WelcomeSocket {
 
 impl WelcomeSocket {
     pub fn new() -> Result<Self> {
+        info!("[DISCOVERY] binding the welcome socket on {LOCAL_IP}:{CONTROL_PORT}");
+
         let socket = UdpSocket::bind((LOCAL_IP, CONTROL_PORT))?;
         // socket.set_read_timeout(Some(read_timeout))?;
         socket.set_nonblocking(true)?;
 
+        info!(
+            "[DISCOVERY] welcome socket bound. local addr {:?}, broadcast {:?}",
+            socket.local_addr(),
+            socket.broadcast(),
+        );
+
         let mdns_receiver = ServiceDaemon::new()?.browse(alvr_sockets::MDNS_SERVICE_TYPE)?;
+
+        info!(
+            "[DISCOVERY] watching mDNS service type {} (protocol {})",
+            alvr_sockets::MDNS_SERVICE_TYPE,
+            alvr_common::protocol_id(),
+        );
 
         Ok(Self {
             buffer: [0; HANDSHAKE_PACKET_SIZE_BYTES],
@@ -42,6 +56,12 @@ impl WelcomeSocket {
                 .handle_try_again()
             {
                 Ok((size, address)) => {
+                    info!(
+                        "[DISCOVERY] broadcast packet: {size}B from {address} (local {:?}); raw: {}",
+                        self.broadcast_receiver.local_addr(),
+                        hex_preview(&self.buffer[..size.min(self.buffer.len())]),
+                    );
+
                     if size == HANDSHAKE_PACKET_SIZE_BYTES
                         && &self.buffer[..ALVR_NAME.len()] == ALVR_NAME.as_bytes()
                         && self.buffer[ALVR_NAME.len()..16].iter().all(|b| *b == 0)
@@ -66,15 +86,27 @@ impl WelcomeSocket {
                             .trim_end_matches('\x00')
                             .to_owned();
 
+                        info!(
+                            "[DISCOVERY] valid ALVR broadcast: hostname \"{hostname}\", ip {}, protocol id {received_protocol_id}",
+                            address.ip(),
+                        );
+
                         clients.insert(hostname, address.ip());
                     } else if &self.buffer[..16]
                         == b"\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00ALVR"
                         || &self.buffer[..5] == b"\x01ALVR"
                     {
+                        info!("[DISCOVERY] packet from {address} is from a too old client");
+
                         warn!("Found old client. Please upgrade")
                     } else {
                         // Unexpected packet.
                         // Note: no need to check for v12 and v13, not found in the wild anymore
+                        info!(
+                            "[DISCOVERY] ignoring unrelated {size}B packet from {address}: {}",
+                            hex_preview(&self.buffer[..size.min(self.buffer.len())]),
+                        );
+
                         warn!("Found unrelated packet during discovery")
                     }
                 }
@@ -86,6 +118,8 @@ impl WelcomeSocket {
         loop {
             match self.mdns_receiver.try_recv() {
                 Ok(event) => {
+                    info!("[DISCOVERY] mDNS event: {event:?}");
+
                     if let ServiceEvent::ServiceResolved(info) = event {
                         let hostname = info
                             .get_property_val_str(alvr_sockets::MDNS_DEVICE_ID_KEY)
@@ -115,12 +149,20 @@ impl WelcomeSocket {
                             warn!("Found incompatible client {hostname}! {reason}\n{protocols}");
                         }
 
+                        info!(
+                            "[DISCOVERY] valid mDNS announcement: hostname \"{hostname}\", ip {address}, protocol {client_protocol}",
+                        );
+
                         clients.insert(hostname.into(), address);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(e) => bail!(e),
             }
+        }
+
+        if !clients.is_empty() {
+            info!("[DISCOVERY] discovered clients: {clients:?}");
         }
 
         Ok(clients)

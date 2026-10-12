@@ -18,6 +18,7 @@ use crate::connection::VideoPacket;
 use alvr_common::{
     dbg_server_core, error,
     glam::Vec2,
+    info,
     once_cell::sync::Lazy,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
@@ -246,14 +247,35 @@ impl ServerCoreContext {
     pub fn start_connection(&self) {
         dbg_server_core!("start_connection");
 
+        info!(
+            "starting the connection runtime in process {} (thread {:?})",
+            std::process::id(),
+            thread::current().id(),
+        );
+
         // Note: Idle state is not used on the server side
         *self.lifecycle_state.write() = LifecycleState::Resumed;
 
         let connection_context = Arc::clone(&self.connection_context);
         let lifecycle_state = Arc::clone(&self.lifecycle_state);
-        *self.connection_thread.write() = Some(thread::spawn(move || {
-            connection::handshake_loop(connection_context, lifecycle_state);
-        }));
+        let connection_thread = thread::Builder::new()
+            .name("ALVR-handshake".to_owned())
+            .spawn(move || {
+                connection::handshake_loop(connection_context, lifecycle_state);
+            });
+
+        match connection_thread {
+            Ok(connection_thread) => {
+                info!(
+                    "handshake thread {:?} spawned (process {})",
+                    connection_thread.thread().id(),
+                    std::process::id(),
+                );
+
+                *self.connection_thread.write() = Some(connection_thread);
+            }
+            Err(e) => error!("failed to spawn the handshake thread: {e}"),
+        }
     }
 
     pub fn get_device_motion(
