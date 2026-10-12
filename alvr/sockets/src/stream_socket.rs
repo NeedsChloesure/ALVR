@@ -18,8 +18,7 @@
 
 use crate::backend::{tcp, udp, SocketReader, SocketWriter};
 use alvr_common::{
-    anyhow::Result, debug, hex_preview, info, parking_lot::Mutex, AnyhowToCon, ConResult,
-    HandleTryAgain, ToCon,
+    anyhow::Result, debug, parking_lot::Mutex, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
 };
 use alvr_session::{DscpTos, SocketBufferSize, SocketProtocol};
 use serde::{de::DeserializeOwned, Serialize};
@@ -29,11 +28,8 @@ use std::{
     marker::PhantomData,
     mem,
     net::{IpAddr, TcpListener, UdpSocket},
-    sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-        mpsc, Arc,
-    },
-    time::{Duration, Instant},
+    sync::{mpsc, Arc},
+    time::Duration,
 };
 
 const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
@@ -41,21 +37,6 @@ const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field 
     + mem::size_of::<u32>() // packet index
     + mem::size_of::<u32>() // shards count
     + mem::size_of::<u32>(); // shards index
-
-static STREAM_IO_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// Streaming packets are sent and received thousands of times per second. Only the first operations
-// (which cover connection setup) are logged in full, then only periodically.
-fn should_log_io(operation_index: u64) -> bool {
-    operation_index <= 200 || operation_index % 500 == 0
-}
-
-fn protocol_desc(protocol: &SocketProtocol) -> &'static str {
-    match protocol {
-        SocketProtocol::Udp => "UDP",
-        SocketProtocol::Tcp => "TCP",
-    }
-}
 
 /// Memory buffer that contains a hidden prefix
 #[derive(Default)]
@@ -118,21 +99,10 @@ impl<H> StreamSender<H> {
     /// Shard and send a buffer with zero copies and zero allocations.
     /// The prefix of each shard is written over the previously sent shard to avoid reallocations.
     pub fn send(&mut self, mut buffer: Buffer<H>) -> Result<()> {
-        let operation = STREAM_IO_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let verbose = should_log_io(operation);
-        let start = Instant::now();
-
         let max_shard_data_size = self.max_packet_size - SHARD_PREFIX_SIZE;
         let actual_buffer_size = buffer.hidden_offset + buffer.length;
         let data_size = actual_buffer_size - SHARD_PREFIX_SIZE;
         let shards_count = (data_size as f32 / max_shard_data_size as f32).ceil() as usize;
-
-        if verbose {
-            info!(
-                "[STREAM-TX] op #{operation}: stream {}, packet {}: {actual_buffer_size}B buffered ({data_size}B payload) -> {shards_count} shard(s) of at most {max_shard_data_size}B",
-                self.stream_id, self.next_packet_index,
-            );
-        }
 
         for idx in 0..shards_count {
             // this overlaps with the previous shard, this is intended behavior and allows to
@@ -155,25 +125,7 @@ impl<H> StreamSender<H> {
             sub_buffer[10..14].copy_from_slice(&(shards_count as u32).to_be_bytes());
             sub_buffer[14..18].copy_from_slice(&(idx as u32).to_be_bytes());
 
-            if let Err(e) = self.inner.lock().send(&sub_buffer[..packet_length]) {
-                info!(
-                    "[STREAM-TX] op #{operation}: SHARD {idx} of {shards_count} (stream {}, packet {}, {packet_length}B) FAILED to send: {e:#}; bytes: {}",
-                    self.stream_id,
-                    self.next_packet_index,
-                    hex_preview(&sub_buffer[..packet_length]),
-                );
-
-                return Err(e);
-            }
-        }
-
-        if verbose {
-            info!(
-                "[STREAM-TX] op #{operation}: stream {}, packet {} ({shards_count} shard(s)) sent in {:?}",
-                self.stream_id,
-                self.next_packet_index,
-                start.elapsed(),
-            );
+            self.inner.lock().send(&sub_buffer[..packet_length])?;
         }
 
         self.next_packet_index += 1;
@@ -288,21 +240,10 @@ impl<H: DeserializeOwned + Serialize> StreamReceiver<H> {
                 Ordering::Equal => (),
                 Ordering::Greater => {
                     // Skipped some indices
-                    info!(
-                        "[STREAM-RX] packet loss: expected index {}, received {}",
-                        last_idx.wrapping_add(1),
-                        packet.index,
-                    );
-
                     had_packet_loss = true
                 }
                 Ordering::Less => {
                     // Old packet, discard
-                    info!(
-                        "[STREAM-RX] discarding out of order packet {} (last index was {last_idx})",
-                        packet.index,
-                    );
-
                     self.used_buffer_queue.send(packet.buffer).to_con()?;
                     return alvr_common::try_again();
                 }
@@ -334,16 +275,7 @@ impl StreamSocketBuilder {
         send_buffer_bytes: SocketBufferSize,
         recv_buffer_bytes: SocketBufferSize,
     ) -> Result<Self> {
-        let start = Instant::now();
-
-        info!(
-            "[STREAM] listening for the server on port {port} using {}, buffers (send {}, recv {}), timeout {timeout:?}",
-            protocol_desc(&stream_socket_config),
-            crate::socket_buffer_size_desc(&send_buffer_bytes),
-            crate::socket_buffer_size_desc(&recv_buffer_bytes),
-        );
-
-        let builder = match stream_socket_config {
+        Ok(match stream_socket_config {
             SocketProtocol::Udp => StreamSocketBuilder::Udp(udp::bind(
                 port,
                 stream_tos_config,
@@ -357,15 +289,7 @@ impl StreamSocketBuilder {
                 send_buffer_bytes,
                 recv_buffer_bytes,
             )?),
-        };
-
-        info!(
-            "[STREAM] stream socket listening in {:?} ({})",
-            start.elapsed(),
-            protocol_desc(&stream_socket_config),
-        );
-
-        Ok(builder)
+        })
     }
 
     pub fn accept_from_server(
@@ -375,10 +299,6 @@ impl StreamSocketBuilder {
         max_packet_size: usize,
         timeout: Duration,
     ) -> ConResult<StreamSocket> {
-        let start = Instant::now();
-
-        info!("[STREAM] accepting the server at {server_ip}:{port} (max packet size {max_packet_size}, timeout {timeout:?})");
-
         let (send_socket, receive_socket): (Box<dyn SocketWriter>, Box<dyn SocketReader>) =
             match self {
                 StreamSocketBuilder::Udp(socket) => {
@@ -394,11 +314,6 @@ impl StreamSocketBuilder {
                     (Box::new(send_socket), Box::new(receive_socket))
                 }
             };
-
-        info!(
-            "[STREAM] stream socket established with the server in {:?}",
-            start.elapsed()
-        );
 
         Ok(StreamSocket {
             // +4 is a workaround to retain compatibilty with old protocol
@@ -422,16 +337,6 @@ impl StreamSocketBuilder {
         recv_buffer_bytes: SocketBufferSize,
         max_packet_size: usize,
     ) -> ConResult<StreamSocket> {
-        let start = Instant::now();
-
-        info!(
-            "[STREAM] connecting to client {client_ip}:{port} using {}, dscp {}, buffers (send {}, recv {}), max packet size {max_packet_size}, timeout {timeout:?}",
-            protocol_desc(&protocol),
-            if dscp.is_some() { "enabled" } else { "disabled" },
-            crate::socket_buffer_size_desc(&send_buffer_bytes),
-            crate::socket_buffer_size_desc(&recv_buffer_bytes),
-        );
-
         let (send_socket, receive_socket): (Box<dyn SocketWriter>, Box<dyn SocketReader>) =
             match protocol {
                 SocketProtocol::Udp => {
@@ -454,12 +359,6 @@ impl StreamSocketBuilder {
                     (Box::new(send_socket), Box::new(receive_socket))
                 }
             };
-
-        info!(
-            "[STREAM] stream socket connected to the client in {:?} ({})",
-            start.elapsed(),
-            protocol_desc(&protocol),
-        );
 
         Ok(StreamSocket {
             // +4 is a workaround to retain compatibilty with old protocol
@@ -577,13 +476,6 @@ impl StreamSocket {
             let shards_count = u32::from_be_bytes(bytes[10..14].try_into().unwrap()) as usize;
             let shard_index = u32::from_be_bytes(bytes[14..18].try_into().unwrap()) as usize;
 
-            if should_log_io(STREAM_IO_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)) {
-                info!(
-                    "[STREAM-RX] shard prefix: stream {stream_id}, packet {packet_index}, shard {shard_index} of {shards_count}, {shard_length}B visible ({SHARD_PREFIX_SIZE}B prefix, {count}B peeked); raw: {}",
-                    hex_preview(&bytes),
-                );
-            }
-
             self.shard_recv_state.insert(RecvState {
                 shard_length,
                 stream_id,
@@ -600,13 +492,6 @@ impl StreamSocket {
             .stream_recv_components
             .get_mut(&shard_recv_state_mut.stream_id)
         else {
-            info!(
-                "[STREAM-RX] received packet for stream {} (packet {}, shard {} of {}) before subscribing to it, discarding",
-                shard_recv_state_mut.stream_id,
-                shard_recv_state_mut.packet_index,
-                shard_recv_state_mut.shard_index,
-                shard_recv_state_mut.shards_count,
-            );
             debug!(
                 "Received packet from stream {} before subscribing!",
                 shard_recv_state_mut.stream_id
@@ -646,13 +531,6 @@ impl StreamSocket {
                 .unwrap()
         } else {
             // This branch may be hit in case the thread related to the stream hangs for some reason
-            info!(
-                "[STREAM-RX] no free buffer for stream {} packet {} ({} in-progress packet(s) for this stream); its shards will be discarded",
-                shard_recv_state_mut.stream_id,
-                shard_recv_state_mut.packet_index,
-                components.in_progress_packets.len(),
-            );
-
             shard_recv_state_mut.should_discard = true;
             shard_recv_state_mut.packet_cursor = 0; // reset cursor from old shards
                                                     // always write at the start of the packet so the buffer doesn't grow much
